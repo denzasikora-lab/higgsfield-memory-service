@@ -1,0 +1,17 @@
+{
+  "name": "scaffold_recall_quality_fixture",
+  "description": "Future deterministic extraction should satisfy these probes.",
+  "probes": [
+    {
+      "conversation": "location_and_employer_evolution",
+      "query": "Where does the user live now?",
+      "expected": ["Berlin"]
+    },
+    {
+      "conversation": "location_and_employer_evolution",
+      "query": "Where does the user work now?",
+      "expected": ["Notion"]
+    }
+  ],
+  "metric": "matched_expected_facts / total_expected_facts"
+}
