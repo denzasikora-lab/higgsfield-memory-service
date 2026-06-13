@@ -27,3 +27,13 @@ agent-ready context.
 **Result:** `/turns` synchronously extracts memories, `/recall` returns current
 facts with historical context when available, `/search` returns structured memory
 results, and user/session delete endpoints remove scoped data.
+
+## v1.0.1 - Review polish
+
+**What changed:** Made `/turns` persistence more atomic, committed repeated
+same-value memory updates correctly, improved natural phrasing extraction for
+relocation and job-title cases, replaced placeholder recency scoring, and added a
+manual verification walkthrough.
+
+**Why:** These changes make the code easier to review and reduce edge-case
+surprises during private evaluation.

@@ -96,6 +96,7 @@ class RetrievalService:
     def _rank(self, query: str, memories: list[MemoryRecord]) -> list[ScoredMemory]:
         query_tokens = self._tokens(query)
         inferred_keys = self._infer_keys(query)
+        recency_scores = self._recency_scores(memories)
         scored: list[ScoredMemory] = []
 
         for memory in memories:
@@ -106,7 +107,7 @@ class RetrievalService:
             key_match = 1.0 if memory.key in inferred_keys else 0.0
             value_match = 1.0 if memory.value.lower() in query.lower() else 0.0
             active_bonus = 1.0 if memory.active else 0.25
-            recency = 1.0
+            recency = recency_scores.get(memory.id, 1.0)
             score = (
                 0.42 * lexical
                 + 0.24 * key_match
@@ -118,6 +119,22 @@ class RetrievalService:
             scored.append(ScoredMemory(memory, score))
 
         return sorted(scored, key=lambda item: item.score, reverse=True)
+
+    @staticmethod
+    def _recency_scores(memories: list[MemoryRecord]) -> dict[str, float]:
+        if not memories:
+            return {}
+
+        timestamps = [memory.updated_at.timestamp() for memory in memories]
+        oldest = min(timestamps)
+        newest = max(timestamps)
+        if newest == oldest:
+            return {memory.id: 1.0 for memory in memories}
+
+        return {
+            memory.id: (memory.updated_at.timestamp() - oldest) / (newest - oldest)
+            for memory in memories
+        }
 
     def _select_for_recall(
         self,

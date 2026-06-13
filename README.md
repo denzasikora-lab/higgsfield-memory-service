@@ -176,6 +176,29 @@ curl -s http://localhost:8080/health
 docker compose run --rm memory-service pytest
 ```
 
+Manual memory check:
+
+```bash
+curl -s -X DELETE http://localhost:8080/users/demo-user
+
+curl -s -X POST http://localhost:8080/turns \
+  -H 'Content-Type: application/json' \
+  --data '{"session_id":"demo-s1","user_id":"demo-user","messages":[{"role":"user","content":"I live in NYC and work at Stripe."}],"timestamp":"2025-03-01T10:00:00Z","metadata":{}}'
+
+curl -s -X POST http://localhost:8080/turns \
+  -H 'Content-Type: application/json' \
+  --data '{"session_id":"demo-s2","user_id":"demo-user","messages":[{"role":"user","content":"I moved from NYC to Berlin last month. I joined Notion as a PM."}],"timestamp":"2025-03-15T10:00:00Z","metadata":{}}'
+
+curl -s -X POST http://localhost:8080/recall \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"Where does this user work now?","session_id":"demo-s2","user_id":"demo-user","max_tokens":256}'
+
+curl -s http://localhost:8080/users/demo-user/memories
+```
+
+Expected result: recall mentions Notion, user memories show Stripe/NYC as
+inactive historical facts and Notion/Berlin as active facts with `supersedes`.
+
 ## Tradeoffs
 
 I optimized for deterministic contract correctness, transparent structured

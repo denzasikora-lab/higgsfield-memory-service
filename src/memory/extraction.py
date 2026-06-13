@@ -7,7 +7,7 @@ from src.schemas.requests import TurnCreateRequest
 
 from .types import ExtractedMemory
 
-STOP = r"(?=\.|,|;|!|\?| and | but | because | as |$)"
+STOP = r"(?=\.|,|;|!|\?| and | but | because | as | last | this | now | recently |$)"
 ENTITY = r"([A-Z][A-Za-z0-9&.'+-]*(?:\s+[A-Z][A-Za-z0-9&.'+-]*)*)"
 LOWER_PHRASE = r"([a-z][A-Za-z0-9&,'+\- /]{1,80})"
 
@@ -75,6 +75,24 @@ class DeterministicExtractor:
             else:
                 value = f"Moved to {current_city}"
             memories.append(ExtractedMemory("event", "relocation", value, 0.86))
+
+        for match in re.finditer(
+            rf"\bI (?:just )?moved from {ENTITY} to {ENTITY}{STOP}",
+            text,
+            re.I,
+        ):
+            previous_city = self._clean_entity(match.group(1))
+            current_city = self._clean_entity(match.group(2))
+            memories.append(self._fact("current_city", current_city, 0.95))
+            memories.append(self._fact("previous_city", previous_city, 0.84))
+            memories.append(
+                ExtractedMemory(
+                    "event",
+                    "relocation",
+                    f"Moved to {current_city} from {previous_city}",
+                    0.86,
+                )
+            )
 
         for match in re.finditer(rf"\bActually,?\s+I meant {ENTITY}{STOP}", text, re.I):
             memories.append(self._fact("current_city", self._clean_entity(match.group(1)), 0.88))
@@ -290,7 +308,12 @@ class DeterministicExtractor:
 
     @classmethod
     def _clean_entity(cls, value: str) -> str:
-        value = re.split(r"\s+(?:and|but|because|as)\s+", value, maxsplit=1, flags=re.I)[0]
+        value = re.split(
+            r"\s+(?:and|but|because|as|last|this|now|recently)\s+|\.\s+I\b",
+            value,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
         return cls._clean(value)
 
     @staticmethod

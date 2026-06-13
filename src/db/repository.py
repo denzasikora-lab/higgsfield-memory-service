@@ -43,7 +43,7 @@ class MemoryRepository:
             metadata_json=payload.metadata,
         )
         self.session.add(turn)
-        await self.session.commit()
+        await self.session.flush()
         return turn_id
 
     async def store_extracted_memories(
@@ -60,10 +60,9 @@ class MemoryRepository:
                 continue
             stored.append(memory)
 
-        if not stored:
-            return []
+        if stored:
+            self.session.add_all(stored)
 
-        self.session.add_all(stored)
         await self.session.commit()
 
         for memory in stored:
