@@ -37,3 +37,12 @@ manual verification walkthrough.
 
 **Why:** These changes make the code easier to review and reduce edge-case
 surprises during private evaluation.
+
+## v1.1.0 - Dynamic semantic memory
+
+**What changed:** Added spaCy-first extraction with OpenAI structured JSON
+fallback, OpenAI embeddings stored in `pgvector`, cosine-first recall/search,
+metadata-driven display labels, and configurable scoped memory eviction.
+
+**Why:** The service now generalizes beyond hardcoded extractors and lexical
+overlap while still keeping deterministic fallbacks for local/no-secret tests.

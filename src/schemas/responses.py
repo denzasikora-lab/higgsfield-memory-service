@@ -49,6 +49,8 @@ class MemoryRecord(BaseModel):
     updated_at: datetime
     supersedes: str | None = None
     active: bool
+    metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    embedding: list[float] | None = Field(default=None, exclude=True)
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from math import sqrt
 
 from src.db.repository import MemoryRepository
+from src.memory.embedding import EmbeddingProvider
 from src.schemas.requests import RecallRequest, SearchRequest
 from src.schemas.responses import (
     Citation,
@@ -15,6 +17,7 @@ from src.schemas.responses import (
 )
 
 HISTORY_WORDS = {"previous", "formerly", "before", "history", "old", "past", "used to"}
+MIN_RETRIEVAL_SCORE = 0.28
 
 QUERY_KEYWORDS = {
     "current_city": {"live", "city", "based", "location", "moved"},
@@ -39,8 +42,13 @@ class ScoredMemory:
 
 
 class RetrievalService:
-    def __init__(self, repository: MemoryRepository):
+    def __init__(
+        self,
+        repository: MemoryRepository,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         self.repository = repository
+        self.embedding_provider = embedding_provider
 
     async def recall(self, payload: RecallRequest) -> RecallResponse:
         memories = await self.repository.list_scoped_memories(
@@ -51,7 +59,14 @@ class RetrievalService:
         if not memories:
             return RecallResponse(context="", citations=[])
 
-        scored = self._rank(payload.query, memories)
+        scored = await self._rank(
+            payload.query,
+            memories,
+            payload.user_id,
+            payload.session_id,
+            include_inactive=True,
+            limit=50,
+        )
         selected = self._select_for_recall(payload.query, scored)
         if not selected:
             return RecallResponse(context="", citations=[])
@@ -68,12 +83,20 @@ class RetrievalService:
         return RecallResponse(context=context, citations=citations)
 
     async def search(self, payload: SearchRequest) -> SearchResponse:
+        include_inactive = self._wants_history(payload.query)
         memories = await self.repository.list_scoped_memories(
             payload.user_id,
             payload.session_id,
-            include_inactive=self._wants_history(payload.query),
+            include_inactive=include_inactive,
         )
-        scored = self._rank(payload.query, memories)
+        scored = await self._rank(
+            payload.query,
+            memories,
+            payload.user_id,
+            payload.session_id,
+            include_inactive=include_inactive,
+            limit=max(payload.limit * 4, 50),
+        )
         results = [
             SearchResult(
                 content=f"{item.memory.type}:{item.memory.key}: {item.memory.value}",
@@ -86,14 +109,96 @@ class RetrievalService:
                     "active": item.memory.active,
                     "source_turn": item.memory.source_turn,
                     "supersedes": item.memory.supersedes,
+                    "labels": item.memory.metadata.get("labels", []),
+                    "display_label": item.memory.metadata.get("display_label"),
                 },
             )
             for item in scored[: payload.limit]
-            if item.score >= 0.32
+            if item.score >= MIN_RETRIEVAL_SCORE
         ]
         return SearchResponse(results=results)
 
-    def _rank(self, query: str, memories: list[MemoryRecord]) -> list[ScoredMemory]:
+    async def _rank(
+        self,
+        query: str,
+        memories: list[MemoryRecord],
+        user_id: str | None,
+        session_id: str | None,
+        include_inactive: bool,
+        limit: int,
+    ) -> list[ScoredMemory]:
+        query_embedding = await self._embed_query(query)
+        if query_embedding is not None:
+            vector_scored = await self._rank_by_vector(
+                query,
+                query_embedding,
+                memories,
+                user_id,
+                session_id,
+                include_inactive,
+                limit,
+            )
+            if vector_scored:
+                return vector_scored
+
+        return self._rank_lexical(query, memories)
+
+    async def _rank_by_vector(
+        self,
+        query: str,
+        query_embedding: list[float],
+        memories: list[MemoryRecord],
+        user_id: str | None,
+        session_id: str | None,
+        include_inactive: bool,
+        limit: int,
+    ) -> list[ScoredMemory]:
+        search_by_vector = getattr(self.repository, "search_scoped_memories_by_vector", None)
+        if callable(search_by_vector):
+            hits = await search_by_vector(
+                query_embedding,
+                user_id,
+                session_id,
+                include_inactive=include_inactive,
+                limit=limit,
+            )
+            return self._score_vector_hits(query, hits)
+
+        embedded_memories = [memory for memory in memories if memory.embedding]
+        hits = [
+            ScoredMemory(memory, self._cosine_similarity(query_embedding, memory.embedding or []))
+            for memory in embedded_memories
+        ]
+        return self._score_vector_hits(query, hits)
+
+    async def _embed_query(self, query: str) -> list[float] | None:
+        if self.embedding_provider is None:
+            return None
+        try:
+            return await self.embedding_provider.embed(query)
+        except Exception:
+            return None
+
+    def _score_vector_hits(self, query: str, hits: list[object]) -> list[ScoredMemory]:
+        inferred_keys = self._infer_keys(query)
+        scored: list[ScoredMemory] = []
+        for hit in hits:
+            memory = hit.memory
+            semantic = max(-1.0, min(1.0, hit.score))
+            key_match = 1.0 if memory.key in inferred_keys else 0.0
+            value_match = 1.0 if memory.value.lower() in query.lower() else 0.0
+            active_bonus = 1.0 if memory.active else 0.25
+            score = (
+                0.86 * semantic
+                + 0.05 * key_match
+                + 0.04 * min(memory.confidence, 1.0)
+                + 0.03 * value_match
+                + 0.02 * active_bonus
+            )
+            scored.append(ScoredMemory(memory, score))
+        return sorted(scored, key=lambda item: item.score, reverse=True)
+
+    def _rank_lexical(self, query: str, memories: list[MemoryRecord]) -> list[ScoredMemory]:
         query_tokens = self._tokens(query)
         inferred_keys = self._infer_keys(query)
         recency_scores = self._recency_scores(memories)
@@ -152,7 +257,7 @@ class RetrievalService:
             if general_query:
                 if memory.active and memory.type in {"fact", "preference", "opinion", "event"}:
                     selected.append(item)
-            elif memory.key in inferred_keys or item.score >= 0.32:
+            elif memory.key in inferred_keys or item.score >= MIN_RETRIEVAL_SCORE:
                 selected.append(item)
 
         return selected[:12]
@@ -214,23 +319,10 @@ class RetrievalService:
 
     @staticmethod
     def _label(memory: MemoryRecord) -> str:
-        if memory.key == "current_city":
-            return f"Currently lives in {memory.value}"
-        if memory.key == "previous_city":
-            return f"Previously lived in {memory.value}"
-        if memory.key == "employer":
-            return f"Works at {memory.value}"
-        if memory.key == "job_title":
-            return f"Job title: {memory.value}"
-        if memory.key == "current_project":
-            return f"Current project: {memory.value}"
-        if memory.key == "allergy":
-            return memory.value
-        if memory.key == "diet":
-            return f"Diet: {memory.value}"
-        if memory.key == "pet":
-            return memory.value
-        return memory.value
+        display_label = memory.metadata.get("display_label")
+        if isinstance(display_label, str) and display_label.strip():
+            return display_label.strip()
+        return f"{memory.key}: {memory.value}"
 
     @staticmethod
     def _previous_values_by_key(memories: list[MemoryRecord]) -> dict[str, str]:
@@ -276,3 +368,16 @@ class RetrievalService:
         if "where" in tokens and not keys:
             keys.add("current_city")
         return keys
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        numerator = sum(
+            left_value * right_value for left_value, right_value in zip(left, right, strict=True)
+        )
+        left_norm = sqrt(sum(value * value for value in left))
+        right_norm = sqrt(sum(value * value for value in right))
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        return numerator / (left_norm * right_norm)

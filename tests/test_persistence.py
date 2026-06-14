@@ -15,3 +15,10 @@ def test_initial_migration_enables_pgvector() -> None:
 
     assert "CREATE EXTENSION IF NOT EXISTS vector" in migration
     assert "Vector(1536)" in migration
+
+
+def test_embedding_migration_adds_cosine_index() -> None:
+    migration = Path("alembic/versions/0002_embedding_cosine_index.py").read_text()
+
+    assert "vector_cosine_ops" in migration
+    assert "ix_memories_embedding_cosine" in migration

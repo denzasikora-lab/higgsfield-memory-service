@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Memory, Turn
+from src.memory.embedding import EmbeddingProvider, memory_embedding_text
 from src.memory.types import ExtractedMemory
 from src.schemas.requests import TurnCreateRequest
 from src.schemas.responses import MemoryRecord
@@ -28,9 +32,38 @@ HARD_SUPERSEDE_KEYS = {
 }
 
 
+@dataclass(frozen=True)
+class MemorySearchHit:
+    memory: MemoryRecord
+    score: float
+
+
+@dataclass(frozen=True)
+class EvictionCandidate:
+    id: str
+    active: bool
+    confidence: float
+    created_at: datetime
+    updated_at: datetime
+    supersedes: str | None
+
+
+@dataclass(frozen=True)
+class MemoryOwnerScope:
+    kind: str
+    value: str
+
+
 class MemoryRepository:
-    def __init__(self, session: AsyncSession):
+    def __init__(
+        self,
+        session: AsyncSession,
+        embedding_provider: EmbeddingProvider | None = None,
+        memory_max_per_scope: int = 200,
+    ):
         self.session = session
+        self.embedding_provider = embedding_provider
+        self.memory_max_per_scope = memory_max_per_scope
 
     async def create_turn(self, payload: TurnCreateRequest) -> str:
         turn_id = f"turn_{uuid4().hex}"
@@ -53,8 +86,9 @@ class MemoryRepository:
         extracted_memories: Iterable[ExtractedMemory],
     ) -> list[MemoryRecord]:
         stored: list[Memory] = []
+        extracted_list = list(extracted_memories)
 
-        for extracted in extracted_memories:
+        for extracted in extracted_list:
             memory = await self._build_memory(payload, turn_id, extracted)
             if memory is None:
                 continue
@@ -62,13 +96,18 @@ class MemoryRepository:
 
         if stored:
             self.session.add_all(stored)
+            await self.session.flush()
 
+        deleted_ids: set[str] = set()
+        if extracted_list:
+            deleted_ids = await self._evict_over_scope_limit(payload.user_id, payload.session_id)
         await self.session.commit()
 
-        for memory in stored:
+        kept_stored = [memory for memory in stored if memory.id not in deleted_ids]
+        for memory in kept_stored:
             await self.session.refresh(memory)
 
-        return [self._memory_to_record(memory) for memory in stored]
+        return [self._memory_to_record(memory) for memory in kept_stored]
 
     async def list_user_memories(self, user_id: str) -> list[MemoryRecord]:
         result = await self.session.execute(
@@ -84,19 +123,7 @@ class MemoryRepository:
         limit: int = 500,
     ) -> list[MemoryRecord]:
         statement = select(Memory)
-
-        if user_id:
-            if session_id:
-                statement = statement.where(
-                    (Memory.user_id == user_id)
-                    | ((Memory.user_id.is_(None)) & (Memory.session_id == session_id))
-                )
-            else:
-                statement = statement.where(Memory.user_id == user_id)
-        elif session_id:
-            statement = statement.where(Memory.session_id == session_id)
-        else:
-            statement = statement.where(Memory.id.is_(None))
+        statement = self._apply_scope(statement, user_id, session_id)
 
         if not include_inactive:
             statement = statement.where(Memory.active.is_(True))
@@ -105,6 +132,30 @@ class MemoryRepository:
             statement.order_by(Memory.updated_at.desc(), Memory.created_at.desc()).limit(limit)
         )
         return [self._memory_to_record(memory) for memory in result.scalars()]
+
+    async def search_scoped_memories_by_vector(
+        self,
+        query_embedding: list[float],
+        user_id: str | None,
+        session_id: str | None,
+        include_inactive: bool = False,
+        limit: int = 50,
+    ) -> list[MemorySearchHit]:
+        distance = Memory.embedding.cosine_distance(query_embedding)
+        statement = select(Memory, distance.label("distance")).where(Memory.embedding.is_not(None))
+        statement = self._apply_scope(statement, user_id, session_id)
+
+        if not include_inactive:
+            statement = statement.where(Memory.active.is_(True))
+
+        result = await self.session.execute(statement.order_by(distance.asc()).limit(limit))
+        hits: list[MemorySearchHit] = []
+        for memory, distance_value in result.all():
+            if distance_value is None:
+                continue
+            score = max(-1.0, min(1.0, 1.0 - float(distance_value)))
+            hits.append(MemorySearchHit(self._memory_to_record(memory), score))
+        return hits
 
     async def delete_session(self, session_id: str) -> None:
         await self.session.execute(
@@ -138,6 +189,12 @@ class MemoryRepository:
             if self._same_value(existing.value, extracted.value):
                 existing.confidence = max(existing.confidence, extracted.confidence)
                 existing.updated_at = payload.timestamp
+                existing.metadata_json = merge_memory_metadata(
+                    existing.metadata_json,
+                    extracted.metadata,
+                )
+                if existing.embedding is None:
+                    existing.embedding = await self._embed_memory(extracted)
                 await self.session.flush()
                 return None
 
@@ -172,6 +229,7 @@ class MemoryRepository:
             supersedes=supersedes,
             active=True,
             metadata_json=extracted.metadata,
+            embedding=await self._embed_memory(extracted),
         )
 
     async def _active_memories_for_key(
@@ -209,7 +267,35 @@ class MemoryRepository:
             updated_at=memory.updated_at,
             supersedes=memory.supersedes,
             active=memory.active,
+            metadata=memory.metadata_json or {},
+            embedding=memory.embedding,
         )
+
+    async def _embed_memory(self, memory: ExtractedMemory) -> list[float] | None:
+        if self.embedding_provider is None:
+            return None
+        return await self.embedding_provider.embed(memory_embedding_text(memory))
+
+    async def _evict_over_scope_limit(self, user_id: str | None, session_id: str) -> set[str]:
+        if self.memory_max_per_scope < 1:
+            return set()
+
+        scope = memory_owner_scope(user_id, session_id)
+        statement = select(Memory)
+        if scope.kind == "user":
+            statement = statement.where(Memory.user_id == scope.value)
+        else:
+            statement = statement.where(Memory.user_id.is_(None), Memory.session_id == scope.value)
+
+        result = await self.session.execute(statement)
+        candidates = list(result.scalars())
+        victims = select_eviction_victims(candidates, self.memory_max_per_scope)
+        for victim in victims:
+            await self.session.delete(victim)
+
+        if victims:
+            await self.session.flush()
+        return {victim.id for victim in victims}
 
     @staticmethod
     def _normalize_key(key: str) -> str:
@@ -241,5 +327,54 @@ class MemoryRepository:
             key=extracted.key,
             value=value,
             confidence=max(existing.confidence * 0.95, extracted.confidence),
-            metadata=extracted.metadata,
+            metadata=merge_memory_metadata(existing.metadata_json, extracted.metadata),
         )
+
+    @staticmethod
+    def _apply_scope(statement: Any, user_id: str | None, session_id: str | None) -> Any:
+        if user_id:
+            if session_id:
+                return statement.where(
+                    (Memory.user_id == user_id)
+                    | ((Memory.user_id.is_(None)) & (Memory.session_id == session_id))
+                )
+            return statement.where(Memory.user_id == user_id)
+        if session_id:
+            return statement.where(Memory.session_id == session_id)
+        return statement.where(Memory.id.is_(None))
+
+
+def select_eviction_victims(
+    candidates: Iterable[EvictionCandidate],
+    max_count: int,
+) -> list[EvictionCandidate]:
+    candidates_list = list(candidates)
+    excess = len(candidates_list) - max_count
+    if excess <= 0:
+        return []
+    return sorted(candidates_list, key=_eviction_sort_key)[:excess]
+
+
+def _eviction_sort_key(candidate: EvictionCandidate) -> tuple[int, float, datetime, datetime]:
+    inactive_or_superseded = not candidate.active or candidate.supersedes is not None
+    return (
+        0 if inactive_or_superseded else 1,
+        candidate.confidence,
+        candidate.updated_at,
+        candidate.created_at,
+    )
+
+
+def memory_owner_scope(user_id: str | None, session_id: str) -> MemoryOwnerScope:
+    if user_id:
+        return MemoryOwnerScope("user", user_id)
+    return MemoryOwnerScope("session", session_id)
+
+
+def merge_memory_metadata(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(left or {})
+    merged.update(right or {})
+    return merged

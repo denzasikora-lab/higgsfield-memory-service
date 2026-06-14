@@ -65,6 +65,9 @@ def client(
     fake_repository: FakeRepository,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("MEMORY_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    monkeypatch.setenv("EXTRACTION_PROVIDER", "deterministic")
     get_settings.cache_clear()
     app = create_app()
     app.dependency_overrides[get_repository] = lambda: fake_repository
